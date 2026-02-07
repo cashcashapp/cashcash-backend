@@ -1,12 +1,11 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import os
-import logging
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional
+from typing import Optional
 from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -26,8 +25,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 app = FastAPI(title="Cash-Cash API", version="2.0.0")
-api_router = APIRouter(prefix="/api")
-auth_router = APIRouter(prefix="/auth")
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -40,6 +37,11 @@ class UserLogin(BaseModel):
 
 class ParticipateRequest(BaseModel):
     city_id: str
+
+class CityCreate(BaseModel):
+    name: str
+    slug: str
+    image_url: Optional[str] = None
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -71,14 +73,11 @@ async def do_register(user: UserCreate):
     result = supabase.table('users').select('*').eq('email', user.email).execute()
     if result.data:
         raise HTTPException(status_code=400, detail="Email déjà utilisé")
-    result = supabase.table('users').select('*').eq('username', user.username).execute()
-    if result.data:
-        raise HTTPException(status_code=400, detail="Nom d'utilisateur déjà pris")
     hashed_password = get_password_hash(user.password)
     new_user = {"email": user.email, "username": user.username, "hashed_password": hashed_password, "wallet_balance": 0, "is_admin": False}
     result = supabase.table('users').insert(new_user).execute()
     if not result.data:
-        raise HTTPException(status_code=500, detail="Erreur lors de la création du compte")
+        raise HTTPException(status_code=500, detail="Erreur création compte")
     created_user = result.data[0]
     token = create_access_token({"sub": created_user["id"]})
     return {"access_token": token, "token_type": "bearer", "user": {"id": created_user["id"], "email": created_user["email"], "username": created_user["username"], "wallet_balance": created_user["wallet_balance"], "is_admin": created_user["is_admin"]}}
@@ -93,31 +92,21 @@ async def do_login(user: UserLogin):
     token = create_access_token({"sub": db_user["id"]})
     return {"access_token": token, "token_type": "bearer", "user": {"id": db_user["id"], "email": db_user["email"], "username": db_user["username"], "wallet_balance": db_user["wallet_balance"], "is_admin": db_user["is_admin"]}}
 
-@api_router.post("/register")
-async def register(user: UserCreate):
-    return await do_register(user)
-
-@api_router.post("/token")
-async def login(user: UserLogin):
-    return await do_login(user)
-
-@auth_router.post("/register")
+# AUTH ROUTES
+@app.post("/auth/register")
 async def auth_register(user: UserCreate):
     return await do_register(user)
 
-@auth_router.post("/login")
+@app.post("/auth/login")
 async def auth_login(user: UserLogin):
     return await do_login(user)
 
-@api_router.get("/auth/me")
-async def get_me(current_user: dict = Depends(get_current_user)):
-    return {"id": current_user["id"], "email": current_user["email"], "username": current_user["username"], "wallet_balance": current_user["wallet_balance"], "is_admin": current_user["is_admin"]}
-
-@auth_router.get("/me")
+@app.get("/auth/me")
 async def auth_me(current_user: dict = Depends(get_current_user)):
     return {"id": current_user["id"], "email": current_user["email"], "username": current_user["username"], "wallet_balance": current_user["wallet_balance"], "is_admin": current_user["is_admin"]}
 
-@api_router.get("/cities")
+# CITIES
+@app.get("/cities")
 async def get_cities(current_user: dict = Depends(get_current_user)):
     result = supabase.table('cities').select('*').eq('is_active', True).execute()
     cities = result.data or []
@@ -125,9 +114,15 @@ async def get_cities(current_user: dict = Depends(get_current_user)):
     participated_city_ids = [p["city_id"] for p in (participations.data or [])]
     for city in cities:
         city["user_has_participated"] = city["id"] in participated_city_ids
+        city["hint_available"] = city.get("hint_published", False) and city.get("hint_image") is not None
     return cities
 
-@api_router.post("/participate")
+@app.post("/init-cities")
+async def init_cities():
+    return {"message": "OK"}
+
+# PARTICIPATE
+@app.post("/participate")
 async def participate(request: ParticipateRequest, current_user: dict = Depends(get_current_user)):
     result = supabase.table('cities').select('*').eq('id', request.city_id).execute()
     if not result.data:
@@ -148,17 +143,62 @@ async def participate(request: ParticipateRequest, current_user: dict = Depends(
     supabase.table('cities').update({"pot_amount": new_pot, "participants_count": new_count}).eq('id', request.city_id).execute()
     return {"message": f"Inscription réussie pour {city['name']}", "new_balance": new_balance}
 
-@api_router.get("/wallet/transactions")
+# STATS
+@app.get("/stats/global")
+async def get_global_stats():
+    cities = supabase.table('cities').select('pot_amount').execute()
+    total_pot = sum(float(c.get("pot_amount", 0)) for c in (cities.data or []))
+    winners = supabase.table('winners').select('amount_won').execute()
+    total_winners = len(winners.data or [])
+    total_distributed = sum(float(w.get("amount_won", 0)) for w in (winners.data or []))
+    active_cities = supabase.table('cities').select('id').eq('is_active', True).execute()
+    return {"total_pot": total_pot, "total_winners": total_winners, "total_distributed": total_distributed, "active_cities": len(active_cities.data or [])}
+
+# WALLET
+@app.get("/wallet/transactions")
 async def get_transactions(current_user: dict = Depends(get_current_user)):
     result = supabase.table('transactions').select('*').eq('user_id', current_user["id"]).order('created_at', desc=True).limit(50).execute()
     return result.data or []
 
-@api_router.get("/health")
-async def health():
-    return {"status": "healthy", "version": "2.0.0", "database": "supabase"}
+# ADMIN - Create City
+@app.post("/admin/cities")
+async def create_city(city: CityCreate, current_user: dict = Depends(get_current_user)):
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only")
+    new_city = {
+        "name": city.name,
+        "slug": city.slug,
+        "image_url": city.image_url,
+        "pot_amount": 0,
+        "participants_count": 0,
+        "is_active": True,
+        "qr_code_secret": secrets.token_urlsafe(16)
+    }
+    result = supabase.table('cities').insert(new_city).execute()
+    return result.data[0] if result.data else {"error": "Failed"}
 
-app.include_router(api_router)
-app.include_router(auth_router)
+@app.get("/admin/cities")
+async def admin_get_cities(current_user: dict = Depends(get_current_user)):
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only")
+    result = supabase.table('cities').select('*').execute()
+    return result.data or []
+
+@app.delete("/admin/cities/{city_id}")
+async def delete_city(city_id: str, current_user: dict = Depends(get_current_user)):
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only")
+    supabase.table('cities').delete().eq('id', city_id).execute()
+    return {"message": "Ville supprimée"}
+
+# HEALTH
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": "2.0.0"}
+
+@app.get("/api/health")
+async def api_health():
+    return {"status": "healthy", "version": "2.0.0"}
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
