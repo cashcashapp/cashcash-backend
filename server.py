@@ -38,10 +38,24 @@ class UserLogin(BaseModel):
 class ParticipateRequest(BaseModel):
     city_id: str
 
+class ScanQRRequest(BaseModel):
+    city_id: str
+    qr_code: str
+    latitude: float = 0
+    longitude: float = 0
+
 class CityCreate(BaseModel):
     name: str
     slug: str
     image_url: Optional[str] = None
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirm(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -105,6 +119,29 @@ async def auth_login(user: UserLogin):
 async def auth_me(current_user: dict = Depends(get_current_user)):
     return {"id": current_user["id"], "email": current_user["email"], "username": current_user["username"], "wallet_balance": current_user["wallet_balance"], "is_admin": current_user["is_admin"]}
 
+@app.post("/auth/forgot-password")
+async def forgot_password(request: PasswordResetRequest):
+    result = supabase.table('users').select('*').eq('email', request.email).execute()
+    if not result.data:
+        return {"message": "Si cet email existe, un code de réinitialisation a été envoyé"}
+    code = secrets.token_urlsafe(6)[:6].upper()
+    supabase.table('users').update({"reset_code": code}).eq('email', request.email).execute()
+    # TODO: Envoyer l'email avec le code
+    print(f"Reset code for {request.email}: {code}")
+    return {"message": "Si cet email existe, un code de réinitialisation a été envoyé", "code": code}
+
+@app.post("/auth/reset-password")
+async def reset_password(request: PasswordResetConfirm):
+    result = supabase.table('users').select('*').eq('email', request.email).execute()
+    if not result.data:
+        raise HTTPException(status_code=400, detail="Email non trouvé")
+    user = result.data[0]
+    if user.get("reset_code") != request.code:
+        raise HTTPException(status_code=400, detail="Code invalide")
+    hashed = get_password_hash(request.new_password)
+    supabase.table('users').update({"hashed_password": hashed, "reset_code": None}).eq('email', request.email).execute()
+    return {"message": "Mot de passe réinitialisé avec succès"}
+
 # CITIES
 @app.get("/cities")
 async def get_cities(current_user: dict = Depends(get_current_user)):
@@ -143,6 +180,28 @@ async def participate(request: ParticipateRequest, current_user: dict = Depends(
     supabase.table('cities').update({"pot_amount": new_pot, "participants_count": new_count}).eq('id', request.city_id).execute()
     return {"message": f"Inscription réussie pour {city['name']}", "new_balance": new_balance}
 
+# SCAN QR
+@app.post("/scan-qr")
+async def scan_qr(request: ScanQRRequest, current_user: dict = Depends(get_current_user)):
+    result = supabase.table('cities').select('*').eq('id', request.city_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Ville non trouvée")
+    city = result.data[0]
+    week = datetime.utcnow().isocalendar()[1]
+    year = datetime.utcnow().year
+    participation = supabase.table('participations').select('*').eq('user_id', current_user["id"]).eq('city_id', request.city_id).eq('week_number', week).eq('year', year).eq('status', 'active').execute()
+    if not participation.data:
+        raise HTTPException(status_code=400, detail="Vous ne participez pas à cette ville")
+    if request.qr_code != city.get("qr_code_secret"):
+        raise HTTPException(status_code=400, detail="QR code invalide")
+    pot_amount = float(city.get("pot_amount", 0))
+    new_balance = float(current_user["wallet_balance"]) + pot_amount
+    supabase.table('users').update({"wallet_balance": new_balance}).eq('id', current_user["id"]).execute()
+    supabase.table('winners').insert({"user_id": current_user["id"], "city_id": request.city_id, "username": current_user["username"], "city_name": city["name"], "amount_won": pot_amount, "week_number": week, "year": year}).execute()
+    supabase.table('participations').update({"status": "won"}).eq('id', participation.data[0]["id"]).execute()
+    supabase.table('cities').update({"pot_amount": 0, "participants_count": 0, "hint_published": False, "hint_image": None, "qr_code_secret": secrets.token_urlsafe(16)}).eq('id', request.city_id).execute()
+    return {"message": "Félicitations! Vous avez gagné!", "amount_won": pot_amount, "new_balance": new_balance}
+
 # STATS
 @app.get("/stats/global")
 async def get_global_stats():
@@ -160,20 +219,12 @@ async def get_transactions(current_user: dict = Depends(get_current_user)):
     result = supabase.table('transactions').select('*').eq('user_id', current_user["id"]).order('created_at', desc=True).limit(50).execute()
     return result.data or []
 
-# ADMIN - Create City
+# ADMIN
 @app.post("/admin/cities")
 async def create_city(city: CityCreate, current_user: dict = Depends(get_current_user)):
     if not current_user.get("is_admin"):
         raise HTTPException(status_code=403, detail="Admin only")
-    new_city = {
-        "name": city.name,
-        "slug": city.slug,
-        "image_url": city.image_url,
-        "pot_amount": 0,
-        "participants_count": 0,
-        "is_active": True,
-        "qr_code_secret": secrets.token_urlsafe(16)
-    }
+    new_city = {"name": city.name, "slug": city.slug, "image_url": city.image_url, "pot_amount": 0, "participants_count": 0, "is_active": True, "qr_code_secret": secrets.token_urlsafe(16)}
     result = supabase.table('cities').insert(new_city).execute()
     return result.data[0] if result.data else {"error": "Failed"}
 
@@ -184,6 +235,16 @@ async def admin_get_cities(current_user: dict = Depends(get_current_user)):
     result = supabase.table('cities').select('*').execute()
     return result.data or []
 
+@app.put("/admin/cities/{city_id}")
+async def update_city(city_id: str, city: CityCreate, current_user: dict = Depends(get_current_user)):
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only")
+    update_data = {"name": city.name, "slug": city.slug}
+    if city.image_url:
+        update_data["image_url"] = city.image_url
+    supabase.table('cities').update(update_data).eq('id', city_id).execute()
+    return {"message": "Ville mise à jour"}
+
 @app.delete("/admin/cities/{city_id}")
 async def delete_city(city_id: str, current_user: dict = Depends(get_current_user)):
     if not current_user.get("is_admin"):
@@ -191,13 +252,19 @@ async def delete_city(city_id: str, current_user: dict = Depends(get_current_use
     supabase.table('cities').delete().eq('id', city_id).execute()
     return {"message": "Ville supprimée"}
 
+@app.put("/admin/cities/{city_id}/hint")
+async def publish_hint(city_id: str, hint_image: str = None, hint_published: bool = True, current_user: dict = Depends(get_current_user)):
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin only")
+    update_data = {"hint_published": hint_published}
+    if hint_image:
+        update_data["hint_image"] = hint_image
+    supabase.table('cities').update(update_data).eq('id', city_id).execute()
+    return {"message": "Indice publié"}
+
 # HEALTH
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "2.0.0"}
-
-@app.get("/api/health")
-async def api_health():
     return {"status": "healthy", "version": "2.0.0"}
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
